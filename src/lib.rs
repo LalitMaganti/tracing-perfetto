@@ -29,7 +29,8 @@ mod idl_helpers;
 struct PerfettoSpanState {
     track_descriptor: Option<idl::TrackDescriptor>, // optional track descriptor for this span, defaults to thread if not found
     trace: idl::Trace, // The Protobuf trace messages that we accumulate for this span.
-    follows_from_flow_ids: Vec<u64>, // Flow IDs this span follows from
+    incoming_flow_ids: Vec<u64>, // Flow IDs this span receives (goes on BEGIN event)
+    outgoing_flow_ids: Vec<u64>, // Flow IDs this span produces (goes on END event)
 }
 
 /// A `Layer` that records span as perfetto's
@@ -293,7 +294,8 @@ where
             trace: idl::Trace {
                 packet: vec![packet],
             },
-            follows_from_flow_ids: Vec::new(),
+            incoming_flow_ids: Vec::new(),
+            outgoing_flow_ids: Vec::new(),
         };
         span.extensions_mut().insert(span_state);
     }
@@ -386,20 +388,26 @@ where
     }
 
     fn on_follows_from(&self, span: &Id, follows: &Id, ctx: Context<'_, S>) {
+        // Don't create flows from a span to itself
+        if span == follows {
+            return;
+        }
+
         let flow_id = self.next_flow_id();
 
-        // Add flow ID to the source span (follows_from span) - use flow_ids on the END event
+        // Add outgoing flow ID to the source span (the one being followed from)
+        // This will be added to the END event when the span closes
         if let Some(follows_span_ref) = ctx.span(follows) {
             if let Some(follows_extensions) = follows_span_ref.extensions_mut().get_mut::<PerfettoSpanState>() {
-                follows_extensions.follows_from_flow_ids.push(flow_id);
-                // We'll add the flow ID to the END event when the span closes
+                follows_extensions.outgoing_flow_ids.push(flow_id);
             }
         }
 
-        // Add flow ID to the target span (the one following from) - use flow_ids on the BEGIN event
+        // Add incoming flow ID to the target span (the one following from)
+        // Add it to the BEGIN event immediately
         if let Some(span_ref) = ctx.span(span) {
             if let Some(span_extensions) = span_ref.extensions_mut().get_mut::<PerfettoSpanState>() {
-                span_extensions.follows_from_flow_ids.push(flow_id);
+                span_extensions.incoming_flow_ids.push(flow_id);
                 // Add flow ID to the BEGIN event
                 if let Some(idl::trace_packet::Data::TrackEvent(ref mut event)) = 
                     span_extensions.trace.packet.first_mut().and_then(|p| p.data.as_mut()) {
@@ -436,8 +444,8 @@ where
             Some(idl::track_event::Type::SliceEnd),
         );
         
-        // Add flow IDs to the END event for spans that have follows_from relationships
-        for &flow_id in &span_state.follows_from_flow_ids {
+        // Add outgoing flow IDs to the END event
+        for &flow_id in &span_state.outgoing_flow_ids {
             event.flow_ids.push(flow_id);
         }
         
@@ -762,7 +770,44 @@ mod tests {
             }
         }
         
-        // We should see flow events on both the BEGIN and END events
-        assert!(flow_events_seen >= 2, "Expected to see at least 2 flow events but found {}", flow_events_seen);
+        // We should see exactly 2 flow events: one on child BEGIN, one on parent END
+        assert_eq!(flow_events_seen, 2, "Expected to see exactly 2 flow events but found {}", flow_events_seen);
+    }
+
+    // Test that self-referencing follows_from is prevented
+    #[test]
+    fn test_follows_from_self_prevention() {
+        let writer = TestWriter::new();
+        let extra_writer = writer.make_writer();
+        let perfetto_layer = PerfettoLayer::new(writer).with_debug_annotations(true);
+        let subscriber = tracing_subscriber::registry().with(perfetto_layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // Try to create a self-referencing follows_from relationship
+        {
+            let span = trace_span!("test_span");
+            
+            // This should be ignored and not create any flow events
+            span.follows_from(&span);
+
+            {
+                let _enter = span.enter();
+            }
+        }
+
+        assert!(extra_writer.buf.lock().unwrap().len() > 0);
+        let trace = idl::Trace::decode(extra_writer.buf.lock().unwrap().as_slice()).unwrap();
+
+        let mut flow_events_seen = 0;
+        for packet in &trace.packet {
+            if let Some(idl::trace_packet::Data::TrackEvent(ref event)) = packet.data {
+                if !event.flow_ids.is_empty() {
+                    flow_events_seen += 1;
+                }
+            }
+        }
+        
+        // Should see no flow events since self-referencing follows_from is prevented
+        assert_eq!(flow_events_seen, 0, "Expected no flow events for self-referencing follows_from but found {}", flow_events_seen);
     }
 }
