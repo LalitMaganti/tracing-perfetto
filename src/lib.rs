@@ -388,17 +388,15 @@ where
     fn on_follows_from(&self, span: &Id, follows: &Id, ctx: Context<'_, S>) {
         let flow_id = self.next_flow_id();
 
-        // Add terminating flow ID to the source span (follows_from span)
+        // Add flow ID to the source span (follows_from span) - use flow_ids on the END event
         if let Some(follows_span_ref) = ctx.span(follows) {
             if let Some(follows_extensions) = follows_span_ref.extensions_mut().get_mut::<PerfettoSpanState>() {
-                if let Some(idl::trace_packet::Data::TrackEvent(ref mut event)) = 
-                    follows_extensions.trace.packet.last_mut().and_then(|p| p.data.as_mut()) {
-                    event.terminating_flow_ids.push(flow_id);
-                }
+                follows_extensions.follows_from_flow_ids.push(flow_id);
+                // We'll add the flow ID to the END event when the span closes
             }
         }
 
-        // Add flow ID to the target span (the one following from)
+        // Add flow ID to the target span (the one following from) - use flow_ids on the BEGIN event
         if let Some(span_ref) = ctx.span(span) {
             if let Some(span_extensions) = span_ref.extensions_mut().get_mut::<PerfettoSpanState>() {
                 span_extensions.follows_from_flow_ids.push(flow_id);
@@ -430,13 +428,19 @@ where
 
         let mut packet = idl::TracePacket::default();
         let meta = span.metadata();
-        let event = create_event(
+        let mut event = create_event(
             track_uuid,
             Some(meta.name()),
             meta.file().zip(meta.line()),
             debug_annotations,
             Some(idl::track_event::Type::SliceEnd),
         );
+        
+        // Add flow IDs to the END event for spans that have follows_from relationships
+        for &flow_id in &span_state.follows_from_flow_ids {
+            event.flow_ids.push(flow_id);
+        }
+        
         packet.data = Some(idl::trace_packet::Data::TrackEvent(event));
         packet.timestamp = chrono::Local::now().timestamp_nanos_opt().map(|t| t as _);
         packet.trusted_pid = Some(std::process::id() as _);
@@ -751,15 +755,14 @@ mod tests {
         let mut flow_events_seen = 0;
         for packet in &trace.packet {
             if let Some(idl::trace_packet::Data::TrackEvent(ref event)) = packet.data {
-                if !event.flow_ids.is_empty() || !event.terminating_flow_ids.is_empty() {
+                if !event.flow_ids.is_empty() {
                     flow_events_seen += 1;
-                    println!("Flow event found: flow_ids={:?}, terminating_flow_ids={:?}", 
-                             event.flow_ids, event.terminating_flow_ids);
+                    println!("Flow event found: flow_ids={:?}", event.flow_ids);
                 }
             }
         }
         
-        // We should see at least one flow event (either flow_ids or terminating_flow_ids)
-        assert!(flow_events_seen > 0, "Expected to see flow events but found none");
+        // We should see flow events on both the BEGIN and END events
+        assert!(flow_events_seen >= 2, "Expected to see at least 2 flow events but found {}", flow_events_seen);
     }
 }
