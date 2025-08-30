@@ -6,6 +6,7 @@ use idl_helpers::process_descriptor;
 use idl_helpers::{create_event, current_thread_uuid, DebugAnnotations};
 use prost::Message;
 use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::field::Field;
 use tracing::field::Visit;
 use tracing::span;
@@ -28,6 +29,7 @@ mod idl_helpers;
 struct PerfettoSpanState {
     track_descriptor: Option<idl::TrackDescriptor>, // optional track descriptor for this span, defaults to thread if not found
     trace: idl::Trace, // The Protobuf trace messages that we accumulate for this span.
+    follows_from_flow_ids: Vec<u64>, // Flow IDs this span follows from
 }
 
 /// A `Layer` that records span as perfetto's
@@ -39,6 +41,7 @@ pub struct PerfettoLayer<W = fn() -> std::io::Stdout> {
     process_track_uuid: TrackUuid,
     writer: W,
     config: Config,
+    flow_id_counter: AtomicU64,
 }
 
 /// Writes encoded records into provided instance.
@@ -67,7 +70,12 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
             process_track_uuid: TrackUuid::new(rand::random()),
             writer,
             config: Config::default(),
+            flow_id_counter: AtomicU64::new(1),
         }
+    }
+
+    fn next_flow_id(&self) -> u64 {
+        self.flow_id_counter.fetch_add(1, Ordering::SeqCst)
     }
 
     /// Configures whether or not spans/events should be recorded with their metadata and fields.
@@ -285,6 +293,7 @@ where
             trace: idl::Trace {
                 packet: vec![packet],
             },
+            follows_from_flow_ids: Vec::new(),
         };
         span.extensions_mut().insert(span_state);
     }
@@ -374,6 +383,32 @@ where
             packet: vec![packet],
         };
         self.write_log(trace, idl_helpers::current_thread_track_descriptor());
+    }
+
+    fn on_follows_from(&self, span: &Id, follows: &Id, ctx: Context<'_, S>) {
+        let flow_id = self.next_flow_id();
+
+        // Add terminating flow ID to the source span (follows_from span)
+        if let Some(follows_span_ref) = ctx.span(follows) {
+            if let Some(follows_extensions) = follows_span_ref.extensions_mut().get_mut::<PerfettoSpanState>() {
+                if let Some(idl::trace_packet::Data::TrackEvent(ref mut event)) = 
+                    follows_extensions.trace.packet.last_mut().and_then(|p| p.data.as_mut()) {
+                    event.terminating_flow_ids.push(flow_id);
+                }
+            }
+        }
+
+        // Add flow ID to the target span (the one following from)
+        if let Some(span_ref) = ctx.span(span) {
+            if let Some(span_extensions) = span_ref.extensions_mut().get_mut::<PerfettoSpanState>() {
+                span_extensions.follows_from_flow_ids.push(flow_id);
+                // Add flow ID to the BEGIN event
+                if let Some(idl::trace_packet::Data::TrackEvent(ref mut event)) = 
+                    span_extensions.trace.packet.first_mut().and_then(|p| p.data.as_mut()) {
+                    event.flow_ids.push(flow_id);
+                }
+            }
+        }
     }
 
     fn on_close(&self, id: Id, ctx: Context<'_, S>) {
@@ -681,5 +716,50 @@ mod tests {
             demo_span.record("extra_arg", "Some Extra Data");
         }
         assert_eq!(extra_writer.buf.lock().unwrap().len(), 0);
+    }
+
+    // Test that follows_from relationships create flow events
+    #[test]
+    fn test_follows_from_flow_events() {
+        let writer = TestWriter::new();
+        let extra_writer = writer.make_writer();
+        let perfetto_layer = PerfettoLayer::new(writer).with_debug_annotations(true);
+        let subscriber = tracing_subscriber::registry().with(perfetto_layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // Create spans and follows_from relationship
+        {
+            let parent_span = trace_span!("parent_span");
+            let child_span = trace_span!("child_span");
+            
+            // Create a follows_from relationship
+            child_span.follows_from(&parent_span);
+
+            // Enter and exit both spans to ensure they are processed
+            {
+                let _parent_enter = parent_span.enter();
+            }
+            
+            {
+                let _child_enter = child_span.enter();
+            }
+        }
+
+        assert!(extra_writer.buf.lock().unwrap().len() > 0);
+        let trace = idl::Trace::decode(extra_writer.buf.lock().unwrap().as_slice()).unwrap();
+
+        let mut flow_events_seen = 0;
+        for packet in &trace.packet {
+            if let Some(idl::trace_packet::Data::TrackEvent(ref event)) = packet.data {
+                if !event.flow_ids.is_empty() || !event.terminating_flow_ids.is_empty() {
+                    flow_events_seen += 1;
+                    println!("Flow event found: flow_ids={:?}, terminating_flow_ids={:?}", 
+                             event.flow_ids, event.terminating_flow_ids);
+                }
+            }
+        }
+        
+        // We should see at least one flow event (either flow_ids or terminating_flow_ids)
+        assert!(flow_events_seen > 0, "Expected to see flow events but found none");
     }
 }
