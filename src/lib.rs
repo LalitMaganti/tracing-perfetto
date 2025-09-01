@@ -425,7 +425,7 @@ where
             meta.file().zip(meta.line()),
             debug_annotations,
             Some(idl::track_event::Type::SliceEnd),
-            None, // Don't add flow ID to end events
+            Some(id.into_u64()), // Use same span ID as flow ID
         );
         
         packet.data = Some(idl::trace_packet::Data::TrackEvent(event));
