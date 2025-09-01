@@ -6,6 +6,7 @@ use idl_helpers::process_descriptor;
 use idl_helpers::{create_event, current_thread_uuid, DebugAnnotations};
 use prost::Message;
 use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::field::Field;
 use tracing::field::Visit;
 use tracing::span;
@@ -28,6 +29,8 @@ mod idl_helpers;
 struct PerfettoSpanState {
     track_descriptor: Option<idl::TrackDescriptor>, // optional track descriptor for this span, defaults to thread if not found
     trace: idl::Trace, // The Protobuf trace messages that we accumulate for this span.
+    incoming_flow_ids: Vec<u64>, // Flow IDs this span receives (goes on BEGIN event)
+    outgoing_flow_ids: Vec<u64>, // Flow IDs this span produces (goes on END event)
 }
 
 /// A `Layer` that records span as perfetto's
@@ -39,6 +42,7 @@ pub struct PerfettoLayer<W = fn() -> std::io::Stdout> {
     process_track_uuid: TrackUuid,
     writer: W,
     config: Config,
+    flow_id_counter: AtomicU64,
 }
 
 /// Writes encoded records into provided instance.
@@ -67,9 +71,13 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
             process_track_uuid: TrackUuid::new(rand::random()),
             writer,
             config: Config::default(),
+            flow_id_counter: AtomicU64::new(1),
         }
     }
 
+    fn next_flow_id(&self) -> u64 {
+        self.flow_id_counter.fetch_add(1, Ordering::SeqCst)
+    }
 
     /// Configures whether or not spans/events should be recorded with their metadata and fields.
     pub fn with_debug_annotations(mut self, value: bool) -> Self {
@@ -271,7 +279,6 @@ where
             span.metadata().file().zip(span.metadata().line()),
             debug_annotations,
             Some(idl::track_event::Type::SliceBegin),
-            Some(id.into_u64()), // Use span ID as flow ID
         );
         packet.data = Some(idl::trace_packet::Data::TrackEvent(event));
         packet.timestamp = chrono::Local::now().timestamp_nanos_opt().map(|t| t as _);
@@ -287,6 +294,8 @@ where
             trace: idl::Trace {
                 packet: vec![packet],
             },
+            incoming_flow_ids: Vec::new(),
+            outgoing_flow_ids: Vec::new(),
         };
         span.extensions_mut().insert(span_state);
     }
@@ -343,7 +352,6 @@ where
             location,
             debug_annotations,
             Some(idl::track_event::Type::Instant),
-            None, // Events don't need flow IDs
         );
 
         let mut packet = idl::TracePacket {
@@ -385,16 +393,25 @@ where
             return;
         }
 
-        // Use the source span's ID as the flow ID
-        let source_flow_id = follows.into_u64();
+        let flow_id = self.next_flow_id();
 
-        // Add the source span's flow ID to the target span's BEGIN event
+        // Add outgoing flow ID to the source span (the one being followed from)
+        // This will be added to the END event when the span closes
+        if let Some(follows_span_ref) = ctx.span(follows) {
+            if let Some(follows_extensions) = follows_span_ref.extensions_mut().get_mut::<PerfettoSpanState>() {
+                follows_extensions.outgoing_flow_ids.push(flow_id);
+            }
+        }
+
+        // Add incoming flow ID to the target span (the one following from)
+        // Add it to the BEGIN event immediately
         if let Some(span_ref) = ctx.span(span) {
             if let Some(span_extensions) = span_ref.extensions_mut().get_mut::<PerfettoSpanState>() {
+                span_extensions.incoming_flow_ids.push(flow_id);
                 // Add flow ID to the BEGIN event
                 if let Some(idl::trace_packet::Data::TrackEvent(ref mut event)) = 
                     span_extensions.trace.packet.first_mut().and_then(|p| p.data.as_mut()) {
-                    event.flow_ids.push(source_flow_id);
+                    event.flow_ids.push(flow_id);
                 }
             }
         }
@@ -419,14 +436,18 @@ where
 
         let mut packet = idl::TracePacket::default();
         let meta = span.metadata();
-        let event = create_event(
+        let mut event = create_event(
             track_uuid,
             Some(meta.name()),
             meta.file().zip(meta.line()),
             debug_annotations,
             Some(idl::track_event::Type::SliceEnd),
-            Some(id.into_u64()), // Use same span ID as flow ID
         );
+        
+        // Add outgoing flow IDs to the END event
+        for &flow_id in &span_state.outgoing_flow_ids {
+            event.flow_ids.push(flow_id);
+        }
         
         packet.data = Some(idl::trace_packet::Data::TrackEvent(event));
         packet.timestamp = chrono::Local::now().timestamp_nanos_opt().map(|t| t as _);

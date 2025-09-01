@@ -122,7 +122,6 @@ pub fn create_event(
     location: Option<(&str, u32)>,
     debug_annotations: DebugAnnotations,
     track_event_type: Option<idl::track_event::Type>,
-    flow_id: Option<u64>,
 ) -> idl::TrackEvent {
     let mut event = idl::TrackEvent {
         track_uuid: Some(track_uuid),
@@ -145,9 +144,6 @@ pub fn create_event(
         };
         let location = idl::track_event::SourceLocationField::SourceLocation(source_location);
         event.source_location_field = Some(location);
-    }
-    if let Some(flow_id) = flow_id {
-        event.flow_ids.push(flow_id);
     }
     event
 }
