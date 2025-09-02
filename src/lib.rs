@@ -79,45 +79,23 @@ impl ClockType {
     /// Get the current timestamp in nanoseconds for this clock type
     fn now_nanos(&self) -> Option<u64> {
         match self {
-            ClockType::Realtime => chrono::Local::now().timestamp_nanos_opt().map(|t| t as u64),
-            ClockType::TryMonotonic => {
-                #[cfg(target_os = "linux")]
-                {
-                    // Use libc to get proper CLOCK_MONOTONIC time on Linux
-                    unsafe {
-                        let mut ts = libc::timespec {
-                            tv_sec: 0,
-                            tv_nsec: 0,
-                        };
-                        if libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) == 0 {
-                            Some((ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64))
-                        } else {
-                            // Fallback to realtime if monotonic fails
-                            chrono::Local::now().timestamp_nanos_opt().map(|t| t as u64)
-                        }
-                    }
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    // Fallback to realtime on non-Linux systems
-                    chrono::Local::now().timestamp_nanos_opt().map(|t| t as u64)
-                }
-            }
+            ClockType::Realtime => get_realtime_nanos(),
+            ClockType::TryMonotonic => get_monotonic_nanos().or_else(get_realtime_nanos),
         }
     }
 
     /// Get the clock ID corresponding to the BuiltinClock enum
     fn clock_id(&self) -> u32 {
         match self {
-            ClockType::Realtime => 1, // BUILTIN_CLOCK_REALTIME
+            ClockType::Realtime => idl::BuiltinClock::Realtime as u32,
             ClockType::TryMonotonic => {
                 #[cfg(target_os = "linux")]
                 {
-                    3 // BUILTIN_CLOCK_MONOTONIC on Linux
+                    idl::BuiltinClock::Monotonic as u32
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
-                    1 // BUILTIN_CLOCK_REALTIME fallback on other platforms
+                    idl::BuiltinClock::Realtime as u32
                 }
             }
         }
@@ -126,13 +104,18 @@ impl ClockType {
 
 impl<W: PerfettoWriter> PerfettoLayer<W> {
     pub fn new(writer: W) -> Self {
-        Self {
+        let layer = Self {
             sequence_id: SequenceId::new(rand::random()),
             process_track_uuid: TrackUuid::new(rand::random()),
             writer,
             config: Config::default(),
             flow_id_counter: AtomicU64::new(1),
-        }
+        };
+
+        // Emit clock sync packet at the start of the trace
+        layer.emit_clock_sync_packet();
+
+        layer
     }
 
     fn next_flow_id(&self) -> u64 {
@@ -190,6 +173,40 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
         self
     }
 
+    /// Emits a clock sync packet containing timestamps from both monotonic and boottime clocks
+    fn emit_clock_sync_packet(&self) {
+        let clocks = create_clock_snapshot_clocks();
+
+        if !clocks.is_empty() {
+            let clock_snapshot = idl::ClockSnapshot {
+                clocks,
+                primary_trace_clock: Some(idl::BuiltinClock::Boottime as i32),
+            };
+
+            let packet = idl::TracePacket {
+                data: Some(idl::trace_packet::Data::ClockSnapshot(clock_snapshot)),
+                trusted_pid: Some(std::process::id() as _),
+                timestamp: self.config.clock_type.now_nanos(),
+                timestamp_clock_id: Some(self.config.clock_type.clock_id()),
+                optional_trusted_packet_sequence_id: Some(
+                    idl::trace_packet::OptionalTrustedPacketSequenceId::TrustedPacketSequenceId(
+                        self.sequence_id.get() as _,
+                    ),
+                ),
+                ..Default::default()
+            };
+
+            let trace = idl::Trace {
+                packet: vec![packet],
+            };
+
+            let mut buf = BytesMut::new();
+            if let Ok(_) = trace.encode(&mut buf) {
+                _ = self.writer.write_log(buf);
+            }
+        }
+    }
+
     fn write_log(&self, mut log: idl::Trace, track_descriptor: idl::TrackDescriptor) {
         let mut buf = BytesMut::new();
 
@@ -218,6 +235,85 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
         };
         _ = self.writer.write_log(buf);
     }
+}
+
+/// Get realtime clock timestamp in nanoseconds
+fn get_realtime_nanos() -> Option<u64> {
+    chrono::Local::now().timestamp_nanos_opt().map(|t| t as u64)
+}
+
+/// Get monotonic clock timestamp in nanoseconds (Linux only)
+fn get_monotonic_nanos() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        get_clock_time_linux(libc::CLOCK_MONOTONIC)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Get boottime clock timestamp in nanoseconds (Linux only)
+fn get_boottime_nanos() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        get_clock_time_linux(libc::CLOCK_BOOTTIME)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Helper function to get current time from a specific clock on Linux
+#[cfg(target_os = "linux")]
+fn get_clock_time_linux(clock_id: libc::clockid_t) -> Option<u64> {
+    unsafe {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        if libc::clock_gettime(clock_id, &mut ts) == 0 {
+            Some((ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64))
+        } else {
+            None
+        }
+    }
+}
+
+/// Create clock snapshot with all available clocks
+fn create_clock_snapshot_clocks() -> Vec<idl::clock_snapshot::Clock> {
+    let mut clocks = Vec::new();
+
+    // Always include realtime clock as a reference
+    if let Some(realtime_ns) = get_realtime_nanos() {
+        clocks.push(idl::clock_snapshot::Clock {
+            clock_id: Some(idl::BuiltinClock::Realtime as u32),
+            timestamp: Some(realtime_ns),
+            ..Default::default()
+        });
+    }
+
+    // Include monotonic clock if available (Linux)
+    if let Some(monotonic_ns) = get_monotonic_nanos() {
+        clocks.push(idl::clock_snapshot::Clock {
+            clock_id: Some(idl::BuiltinClock::Monotonic as u32),
+            timestamp: Some(monotonic_ns),
+            ..Default::default()
+        });
+    }
+
+    // Include boottime clock if available (Linux)
+    if let Some(boottime_ns) = get_boottime_nanos() {
+        clocks.push(idl::clock_snapshot::Clock {
+            clock_id: Some(idl::BuiltinClock::Boottime as u32),
+            timestamp: Some(boottime_ns),
+            ..Default::default()
+        });
+    }
+
+    clocks
 }
 
 struct SequenceId(u64);
@@ -476,7 +572,10 @@ where
         // Add outgoing flow ID to the source span (the one being followed from)
         // This will be added to the END event when the span closes
         if let Some(follows_span_ref) = ctx.span(follows) {
-            if let Some(follows_extensions) = follows_span_ref.extensions_mut().get_mut::<PerfettoSpanState>() {
+            if let Some(follows_extensions) = follows_span_ref
+                .extensions_mut()
+                .get_mut::<PerfettoSpanState>()
+            {
                 follows_extensions.outgoing_flow_ids.push(flow_id);
             }
         }
@@ -484,11 +583,16 @@ where
         // Add incoming flow ID to the target span (the one following from)
         // Add it to the BEGIN event immediately
         if let Some(span_ref) = ctx.span(span) {
-            if let Some(span_extensions) = span_ref.extensions_mut().get_mut::<PerfettoSpanState>() {
+            if let Some(span_extensions) = span_ref.extensions_mut().get_mut::<PerfettoSpanState>()
+            {
                 span_extensions.incoming_flow_ids.push(flow_id);
                 // Add flow ID to the BEGIN event
-                if let Some(idl::trace_packet::Data::TrackEvent(ref mut event)) = 
-                    span_extensions.trace.packet.first_mut().and_then(|p| p.data.as_mut()) {
+                if let Some(idl::trace_packet::Data::TrackEvent(ref mut event)) = span_extensions
+                    .trace
+                    .packet
+                    .first_mut()
+                    .and_then(|p| p.data.as_mut())
+                {
                     event.flow_ids.push(flow_id);
                 }
             }
@@ -521,12 +625,12 @@ where
             debug_annotations,
             Some(idl::track_event::Type::SliceEnd),
         );
-        
+
         // Add outgoing flow IDs to the END event
         for &flow_id in &span_state.outgoing_flow_ids {
             event.flow_ids.push(flow_id);
         }
-        
+
         packet.data = Some(idl::trace_packet::Data::TrackEvent(event));
         packet.timestamp = self.config.clock_type.now_nanos();
         packet.timestamp_clock_id = Some(self.config.clock_type.clock_id());
@@ -822,7 +926,7 @@ mod tests {
         {
             let parent_span = trace_span!("parent_span");
             let child_span = trace_span!("child_span");
-            
+
             // Create a follows_from relationship
             child_span.follows_from(&parent_span);
 
@@ -830,7 +934,7 @@ mod tests {
             {
                 let _parent_enter = parent_span.enter();
             }
-            
+
             {
                 let _child_enter = child_span.enter();
             }
@@ -848,9 +952,13 @@ mod tests {
                 }
             }
         }
-        
+
         // We should see exactly 2 flow events: one on child BEGIN, one on parent END
-        assert_eq!(flow_events_seen, 2, "Expected to see exactly 2 flow events but found {}", flow_events_seen);
+        assert_eq!(
+            flow_events_seen, 2,
+            "Expected to see exactly 2 flow events but found {}",
+            flow_events_seen
+        );
     }
 
     // Test that self-referencing follows_from is prevented
@@ -865,7 +973,7 @@ mod tests {
         // Try to create a self-referencing follows_from relationship
         {
             let span = trace_span!("test_span");
-            
+
             // This should be ignored and not create any flow events
             span.follows_from(&span);
 
@@ -885,8 +993,12 @@ mod tests {
                 }
             }
         }
-        
+
         // Should see no flow events since self-referencing follows_from is prevented
-        assert_eq!(flow_events_seen, 0, "Expected no flow events for self-referencing follows_from but found {}", flow_events_seen);
+        assert_eq!(
+            flow_events_seen, 0,
+            "Expected no flow events for self-referencing follows_from but found {}",
+            flow_events_seen
+        );
     }
 }
