@@ -62,6 +62,66 @@ impl<W: for<'writer> MakeWriter<'writer> + 'static> PerfettoWriter for W {
 struct Config {
     debug_annotations: bool,
     filter: Option<fn(&str) -> bool>,
+    clock_type: ClockType,
+}
+
+/// Clock type used for timestamps
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClockType {
+    /// Use CLOCK_REALTIME (default, matches current behavior with chrono::Local)
+    #[default]
+    Realtime,
+    /// Try to use CLOCK_MONOTONIC on Linux, fallback to CLOCK_REALTIME on other platforms
+    TryMonotonic,
+}
+
+impl ClockType {
+    /// Get the current timestamp in nanoseconds for this clock type
+    fn now_nanos(&self) -> Option<u64> {
+        match self {
+            ClockType::Realtime => chrono::Local::now().timestamp_nanos_opt().map(|t| t as u64),
+            ClockType::TryMonotonic => {
+                #[cfg(target_os = "linux")]
+                {
+                    // Use libc to get proper CLOCK_MONOTONIC time on Linux
+                    unsafe {
+                        let mut ts = libc::timespec {
+                            tv_sec: 0,
+                            tv_nsec: 0,
+                        };
+                        if libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) == 0 {
+                            Some((ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64))
+                        } else {
+                            // Fallback to realtime if monotonic fails
+                            chrono::Local::now().timestamp_nanos_opt().map(|t| t as u64)
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    // Fallback to realtime on non-Linux systems
+                    chrono::Local::now().timestamp_nanos_opt().map(|t| t as u64)
+                }
+            }
+        }
+    }
+
+    /// Get the clock ID corresponding to the BuiltinClock enum
+    fn clock_id(&self) -> u32 {
+        match self {
+            ClockType::Realtime => 1, // BUILTIN_CLOCK_REALTIME
+            ClockType::TryMonotonic => {
+                #[cfg(target_os = "linux")]
+                {
+                    3 // BUILTIN_CLOCK_MONOTONIC on Linux
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    1 // BUILTIN_CLOCK_REALTIME fallback on other platforms
+                }
+            }
+        }
+    }
 }
 
 impl<W: PerfettoWriter> PerfettoLayer<W> {
@@ -111,6 +171,22 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
     /// ```
     pub fn with_filter_by_marker(mut self, filter: fn(&str) -> bool) -> Self {
         self.config.filter = Some(filter);
+        self
+    }
+
+    /// Configures the clock type to use for timestamps.
+    ///
+    /// ```rust
+    /// use tracing_perfetto::{PerfettoLayer, ClockType};
+    /// use tracing_subscriber::{layer::SubscriberExt, Registry, prelude::*};
+    ///
+    /// // Use monotonic clock instead of realtime clock
+    /// let layer = PerfettoLayer::new(std::fs::File::open("/tmp/test.pftrace").unwrap())
+    ///                 .with_clock_type(ClockType::TryMonotonic);
+    /// tracing_subscriber::registry().with(layer).init();
+    /// ```
+    pub fn with_clock_type(mut self, clock_type: ClockType) -> Self {
+        self.config.clock_type = clock_type;
         self
     }
 
@@ -281,7 +357,8 @@ where
             Some(idl::track_event::Type::SliceBegin),
         );
         packet.data = Some(idl::trace_packet::Data::TrackEvent(event));
-        packet.timestamp = chrono::Local::now().timestamp_nanos_opt().map(|t| t as _);
+        packet.timestamp = self.config.clock_type.now_nanos();
+        packet.timestamp_clock_id = Some(self.config.clock_type.clock_id());
         packet.trusted_pid = Some(std::process::id() as _);
         packet.optional_trusted_packet_sequence_id = Some(
             idl::trace_packet::OptionalTrustedPacketSequenceId::TrustedPacketSequenceId(
@@ -356,7 +433,8 @@ where
 
         let mut packet = idl::TracePacket {
             trusted_pid: Some(std::process::id() as _),
-            timestamp: chrono::Local::now().timestamp_nanos_opt().map(|t| t as _),
+            timestamp: self.config.clock_type.now_nanos(),
+            timestamp_clock_id: Some(self.config.clock_type.clock_id()),
             optional_trusted_packet_sequence_id: Some(
                 idl::trace_packet::OptionalTrustedPacketSequenceId::TrustedPacketSequenceId(
                     self.sequence_id.get() as _,
@@ -450,7 +528,8 @@ where
         }
         
         packet.data = Some(idl::trace_packet::Data::TrackEvent(event));
-        packet.timestamp = chrono::Local::now().timestamp_nanos_opt().map(|t| t as _);
+        packet.timestamp = self.config.clock_type.now_nanos();
+        packet.timestamp_clock_id = Some(self.config.clock_type.clock_id());
         packet.trusted_pid = Some(std::process::id() as _);
         packet.optional_trusted_packet_sequence_id = Some(
             idl::trace_packet::OptionalTrustedPacketSequenceId::TrustedPacketSequenceId(

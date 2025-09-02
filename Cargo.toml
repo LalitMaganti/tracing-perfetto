@@ -19,6 +19,7 @@ Tracing layer for recording spans and events as perfetto event format.
 anyhow = "1.0.86"
 bytes = "1.6.0"
 chrono = "0.4.38"
+libc = "0.2"
 prost = "0.13"
 rand = "0.9"
 thread-id = "5.0"
