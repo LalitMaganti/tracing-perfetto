@@ -20,6 +20,20 @@ pub fn unique_uuid() -> u64 {
     // GLOBAL_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Get the current thread ID using the appropriate system call
+/// On Linux, this uses gettid() syscall for accurate thread IDs
+/// On other platforms, falls back to thread-id crate
+fn get_thread_id() -> u32 {
+    #[cfg(target_os = "linux")]
+    {
+        unsafe { libc::syscall(libc::SYS_gettid) as u32 }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        thread_id::get() as u32
+    }
+}
+
 pub fn current_thread_uuid() -> u64 {
     THREAD_TRACK_UUID.with(|id| id.load(Ordering::Relaxed))
 }
@@ -27,7 +41,7 @@ pub fn current_thread_uuid() -> u64 {
 pub fn current_thread_descriptor() -> idl::ThreadDescriptor {
     let mut thread = idl::ThreadDescriptor::default();
     thread.pid = Some(std::process::id() as _);
-    thread.tid = Some(thread_id::get() as _);
+    thread.tid = Some(get_thread_id() as _);
     thread.thread_name = std::thread::current().name().map(|n| n.to_string());
     thread
 }
